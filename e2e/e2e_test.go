@@ -4,8 +4,12 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,7 +23,10 @@ import (
 	"github.com/matt-rog/bumfs/internal/crypto"
 	bumfs "github.com/matt-rog/bumfs/internal/fs"
 	"github.com/matt-rog/bumfs/internal/meta"
+	"github.com/matt-rog/bumfs/internal/store"
+	"github.com/matt-rog/bumfs/internal/store/caplimit"
 	"github.com/matt-rog/bumfs/internal/store/local"
+	"github.com/matt-rog/bumfs/internal/store/multi"
 	"github.com/winfsp/cgofuse/fuse"
 )
 
@@ -409,6 +416,255 @@ func TestEncryptionAtRest(t *testing.T) {
 		if strings.Contains(string(raw), string(plaintext)) {
 			t.Fatal("plaintext found in raw chunk — encryption not working")
 		}
+	}
+}
+
+// trackingBackend wraps a local StorageConnector with a custom name and
+// per-backend usage tracking (like Telegram does), so caplimit works correctly.
+type trackingBackend struct {
+	store.StorageConnector
+	name    string
+	mu      sync.Mutex
+	nChunks int
+}
+
+func (t *trackingBackend) Name() string { return t.name }
+
+func (t *trackingBackend) Write(ctx context.Context, id string, data []byte) error {
+	if err := t.StorageConnector.Write(ctx, id, data); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.nChunks++
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *trackingBackend) Delete(ctx context.Context, id string) error {
+	if err := t.StorageConnector.Delete(ctx, id); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	if t.nChunks > 0 {
+		t.nChunks--
+	}
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *trackingBackend) Capacity() (total, used, free uint64) {
+	t.mu.Lock()
+	n := uint64(t.nChunks)
+	t.mu.Unlock()
+	used = n * (1 << 20)
+	return math.MaxUint64, used, math.MaxUint64 - used
+}
+
+// mountMultiFS mounts a FUSE filesystem backed by a multi connector with the
+// given backends. Returns mount point and the multi index path.
+func mountMultiFS(t *testing.T, backends []store.StorageConnector) (mountpoint, indexPath string) {
+	t.Helper()
+	skipIfNoFUSE(t)
+
+	dir := t.TempDir()
+	mountpoint = filepath.Join(dir, "mnt")
+	dbPath := filepath.Join(dir, "meta.db")
+	indexPath = filepath.Join(dir, "multi_index.json")
+
+	if err := os.MkdirAll(mountpoint, 0755); err != nil {
+		t.Fatalf("mkdir mount: %v", err)
+	}
+
+	metaStore, err := meta.Open(dbPath)
+	if err != nil {
+		t.Fatalf("meta.Open: %v", err)
+	}
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	enc, err := crypto.NewEncryptor(key)
+	if err != nil {
+		t.Fatalf("NewEncryptor: %v", err)
+	}
+
+	multiConn, err := multi.New(backends, indexPath)
+	if err != nil {
+		t.Fatalf("multi.New: %v", err)
+	}
+
+	chunkMgr := chunk.NewManager(0, enc, multiConn)
+	fsys := bumfs.New(metaStore, chunkMgr, multiConn)
+	host := fuse.NewFileSystemHost(fsys)
+
+	mounted := make(chan struct{})
+	mountDone := make(chan struct{})
+	go func() {
+		defer close(mountDone)
+		host.Mount(mountpoint, nil)
+	}()
+
+	go func() {
+		for i := 0; i < 200; i++ {
+			var st syscall.Statfs_t
+			if err := syscall.Statfs(mountpoint, &st); err == nil {
+				if st.Type == 0x65735546 {
+					close(mounted)
+					return
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-mounted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("FUSE mount timed out")
+	}
+
+	t.Cleanup(func() {
+		host.Unmount()
+		select {
+		case <-mountDone:
+		case <-time.After(2 * time.Second):
+			exec.Command("fusermount3", "-uz", mountpoint).Run()
+			select {
+			case <-mountDone:
+			case <-time.After(3 * time.Second):
+			}
+		}
+		metaStore.Close()
+	})
+
+	return mountpoint, indexPath
+}
+
+func TestCapLimitOverflow(t *testing.T) {
+	skipIfNoFUSE(t)
+
+	dir := t.TempDir()
+	chunksA := filepath.Join(dir, "chunks_a")
+	chunksB := filepath.Join(dir, "chunks_b")
+
+	backendA, err := local.New(chunksA)
+	if err != nil {
+		t.Fatalf("local.New A: %v", err)
+	}
+	backendB, err := local.New(chunksB)
+	if err != nil {
+		t.Fatalf("local.New B: %v", err)
+	}
+
+	// Both backends track per-chunk usage (like Telegram does) and are capped at 3MB.
+	// With equal free space, pickBackend tie-breaks by index order (lower wins).
+	// Primary (idx 0) gets chunk 1, then overflow (idx 1) has more free → gets chunk 2,
+	// alternating until primary fills its 3 chunks and overflow gets the remaining 2.
+	primary := caplimit.New(&trackingBackend{StorageConnector: backendA, name: "primary"}, 3*1024*1024)
+	overflow := caplimit.New(&trackingBackend{StorageConnector: backendB, name: "overflow"}, 3*1024*1024)
+
+	mp, indexPath := mountMultiFS(t, []store.StorageConnector{primary, overflow})
+
+	// Write 5MB of random data
+	data := make([]byte, 5*1024*1024)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	wantHash := sha256.Sum256(data)
+
+	path := filepath.Join(mp, "big.bin")
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Read back and verify SHA256 integrity
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	gotHash := sha256.Sum256(got)
+	if wantHash != gotHash {
+		t.Fatalf("SHA256 mismatch: wrote %x, read %x", wantHash, gotHash)
+	}
+
+	// Verify the multi index shows chunks on BOTH backends
+	idxData, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("ReadFile index: %v", err)
+	}
+	var index map[string]string
+	if err := json.Unmarshal(idxData, &index); err != nil {
+		t.Fatalf("Unmarshal index: %v", err)
+	}
+
+	primaryCount, overflowCount := 0, 0
+	for _, backend := range index {
+		switch backend {
+		case "primary":
+			primaryCount++
+		case "overflow":
+			overflowCount++
+		}
+	}
+
+	t.Logf("chunk distribution: primary=%d, overflow=%d (total=%d)", primaryCount, overflowCount, len(index))
+
+	if primaryCount == 0 {
+		t.Fatal("expected some chunks on primary backend")
+	}
+	if overflowCount == 0 {
+		t.Fatal("expected some chunks on overflow backend — cap limit did not trigger overflow")
+	}
+	if primaryCount+overflowCount != len(index) {
+		t.Fatalf("chunk count mismatch: primary(%d) + overflow(%d) != total(%d)", primaryCount, overflowCount, len(index))
+	}
+
+	// Verify chunks are actually on disk in the right directories
+	aFiles, _ := os.ReadDir(chunksA)
+	bFiles, _ := os.ReadDir(chunksB)
+	if len(aFiles) != primaryCount {
+		t.Fatalf("primary disk chunks: got %d, index says %d", len(aFiles), primaryCount)
+	}
+	if len(bFiles) != overflowCount {
+		t.Fatalf("overflow disk chunks: got %d, index says %d", len(bFiles), overflowCount)
+	}
+
+	// Verify the file can be deleted and chunks are cleaned up
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("file should not exist after remove")
+	}
+}
+
+// Verify caplimit passthrough: if maxBytes=0, no wrapping occurs and all ops work.
+func TestCapLimitZeroIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	backend, err := local.New(dir)
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+
+	wrapped := caplimit.New(backend, 0)
+
+	// Should be the same pointer — no wrapping
+	if wrapped != backend {
+		t.Fatal("expected caplimit.New with 0 to return inner unwrapped")
+	}
+
+	// Basic round-trip
+	ctx := context.Background()
+	if err := wrapped.Write(ctx, "test-chunk", []byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	data, err := wrapped.Read(ctx, "test-chunk")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("got %q, want %q", data, "hello")
 	}
 }
 

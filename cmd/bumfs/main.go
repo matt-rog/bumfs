@@ -17,6 +17,7 @@ import (
 	"github.com/matt-rog/bumfs/internal/meta"
 	"github.com/matt-rog/bumfs/internal/store"
 	"github.com/matt-rog/bumfs/internal/store/cache"
+	"github.com/matt-rog/bumfs/internal/store/caplimit"
 	"github.com/matt-rog/bumfs/internal/store/local"
 	"github.com/matt-rog/bumfs/internal/store/multi"
 	"github.com/matt-rog/bumfs/internal/store/ratelimit"
@@ -104,7 +105,9 @@ func cmdMount() {
 		if err != nil {
 			log.Fatalf("bumfs: create backend %q: %v", name, err)
 		}
-		backends = append(backends, ratelimit.New(raw, backendCfg.RateLimit))
+		wrapped := ratelimit.New(raw, backendCfg.RateLimit)
+		wrapped = caplimit.New(wrapped, backendCfg.MaxCapacity)
+		backends = append(backends, wrapped)
 	}
 	if len(backends) == 0 {
 		log.Fatal("bumfs: no backends configured")

@@ -140,7 +140,11 @@ func (b *Backend) Delete(_ context.Context, id string) error {
 }
 
 func (b *Backend) Capacity() (total, used, free uint64) {
-	return math.MaxUint64, 0, math.MaxUint64
+	b.mu.RLock()
+	n := uint64(len(b.index))
+	b.mu.RUnlock()
+	used = n * (1 << 20) // estimate: 1MB per chunk
+	return math.MaxUint64, used, math.MaxUint64 - used
 }
 
 func (b *Backend) HealthCheck(ctx context.Context) error {
