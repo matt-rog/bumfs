@@ -10,12 +10,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/matt-rog/bumfs/internal/config"
 	"github.com/matt-rog/bumfs/internal/store"
 )
+
+func init() {
+	store.Register("wandb", func(cfg config.BackendConfig, dataDir string) (store.StorageConnector, error) {
+		dbPath := filepath.Join(dataDir, "wandb_index.json")
+		return New(cfg.ApiKey, cfg.Entity, cfg.Project, dbPath)
+	})
+}
 
 const apiBase = "https://api.wandb.ai"
 
@@ -25,9 +33,7 @@ type Backend struct {
 	entity  string
 	project string
 	client  *http.Client
-	mu      sync.RWMutex
-	index   map[string]string // chunkID → artifact GraphQL ID
-	dbPath  string
+	index   *store.Index[string]
 	runMu   sync.Mutex
 	runOK   bool
 }
@@ -36,27 +42,24 @@ var _ store.StorageConnector = (*Backend)(nil)
 
 // New creates a W&B storage backend.
 func New(apiKey, entity, project, dbPath string) (*Backend, error) {
-	b := &Backend{
+	idx, err := store.NewIndex[string](dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("wandb backend: load index: %w", err)
+	}
+	return &Backend{
 		apiKey:  apiKey,
 		entity:  entity,
 		project: project,
 		client:  &http.Client{},
-		index:   make(map[string]string),
-		dbPath:  dbPath,
-	}
-	if err := b.loadIndex(); err != nil {
-		return nil, fmt.Errorf("wandb backend: load index: %w", err)
-	}
-	return b, nil
+		index:   idx,
+	}, nil
 }
 
 func (b *Backend) Name() string { return "wandb" }
 
 func (b *Backend) Capacity() (total, used, free uint64) {
 	total = 100 * 1024 * 1024 * 1024 // 100GB free tier
-	b.mu.RLock()
-	count := uint64(len(b.index))
-	b.mu.RUnlock()
+	count := uint64(b.index.Len())
 	used = count * 1024 * 1024 // estimate 1MB per chunk
 	if used > total {
 		free = 0
@@ -195,16 +198,12 @@ func (b *Backend) Write(ctx context.Context, id string, data []byte) error {
 		return fmt.Errorf("wandb write %s: commit: %w", id, err)
 	}
 
-	b.mu.Lock()
-	b.index[id] = artID
-	b.mu.Unlock()
-	return b.saveIndex()
+	b.index.Set(id, artID)
+	return b.index.Save()
 }
 
 func (b *Backend) Read(ctx context.Context, id string) ([]byte, error) {
-	b.mu.RLock()
-	artID, ok := b.index[id]
-	b.mu.RUnlock()
+	artID, ok := b.index.Get(id)
 	if !ok {
 		return nil, fmt.Errorf("wandb read %s: not in index", id)
 	}
@@ -257,9 +256,7 @@ func (b *Backend) Read(ctx context.Context, id string) ([]byte, error) {
 }
 
 func (b *Backend) Delete(ctx context.Context, id string) error {
-	b.mu.RLock()
-	artID, ok := b.index[id]
-	b.mu.RUnlock()
+	artID, ok := b.index.Get(id)
 	if !ok {
 		return nil
 	}
@@ -271,10 +268,8 @@ func (b *Backend) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("wandb delete %s: %w", id, err)
 	}
 
-	b.mu.Lock()
-	delete(b.index, id)
-	b.mu.Unlock()
-	return b.saveIndex()
+	b.index.Delete(id)
+	return b.index.Save()
 }
 
 // --- helpers ---
@@ -365,25 +360,3 @@ func decodeIntID(gqlID string) string {
 	return gqlID
 }
 
-func (b *Backend) loadIndex() error {
-	data, err := os.ReadFile(b.dbPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return json.Unmarshal(data, &b.index)
-}
-
-func (b *Backend) saveIndex() error {
-	b.mu.RLock()
-	data, err := json.Marshal(b.index)
-	b.mu.RUnlock()
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(b.dbPath, data, 0600)
-}
