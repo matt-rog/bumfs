@@ -7,8 +7,15 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/matt-rog/bumfs/internal/config"
 	"github.com/matt-rog/bumfs/internal/store"
 )
+
+func init() {
+	store.Register("local", func(cfg config.BackendConfig, dataDir string) (store.StorageConnector, error) {
+		return New(cfg.Path)
+	})
+}
 
 // Backend stores chunks as individual files in a directory.
 type Backend struct {
