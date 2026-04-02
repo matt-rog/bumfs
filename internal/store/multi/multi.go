@@ -2,11 +2,8 @@ package multi
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
-	"sync"
 
 	"github.com/matt-rog/bumfs/internal/store"
 )
@@ -15,9 +12,7 @@ import (
 // holds each chunk via a JSON-persisted index.
 type Connector struct {
 	backends []store.StorageConnector
-	mu       sync.RWMutex
-	index    map[string]string // chunkID → backend name
-	dbPath   string
+	index    *store.Index[string]
 }
 
 var _ store.StorageConnector = (*Connector)(nil)
@@ -28,15 +23,14 @@ func New(backends []store.StorageConnector, dbPath string) (*Connector, error) {
 	if len(backends) == 0 {
 		return nil, fmt.Errorf("multi: no backends provided")
 	}
-	c := &Connector{
-		backends: backends,
-		index:    make(map[string]string),
-		dbPath:   dbPath,
-	}
-	if err := c.loadIndex(); err != nil {
+	idx, err := store.NewIndex[string](dbPath)
+	if err != nil {
 		return nil, fmt.Errorf("multi: load index: %w", err)
 	}
-	return c, nil
+	return &Connector{
+		backends: backends,
+		index:    idx,
+	}, nil
 }
 
 func (c *Connector) Name() string { return "multi" }
@@ -48,11 +42,8 @@ func (c *Connector) Write(ctx context.Context, id string, data []byte) error {
 		return err
 	}
 
-	c.mu.Lock()
-	c.index[id] = backend.Name()
-	c.mu.Unlock()
-
-	return c.saveIndex()
+	c.index.Set(id, backend.Name())
+	return c.index.Save()
 }
 
 // Read retrieves a chunk from the backend that holds it.
@@ -76,11 +67,8 @@ func (c *Connector) Delete(ctx context.Context, id string) error {
 		return err
 	}
 
-	c.mu.Lock()
-	delete(c.index, id)
-	c.mu.Unlock()
-
-	return c.saveIndex()
+	c.index.Delete(id)
+	return c.index.Save()
 }
 
 // Capacity returns the aggregate capacity across all backends.
@@ -127,10 +115,7 @@ func (c *Connector) pickBackend() store.StorageConnector {
 
 // lookup finds the backend holding a chunk by its index entry.
 func (c *Connector) lookup(id string) (store.StorageConnector, error) {
-	c.mu.RLock()
-	name, ok := c.index[id]
-	c.mu.RUnlock()
-
+	name, ok := c.index.Get(id)
 	if !ok {
 		return nil, fmt.Errorf("multi: chunk %s not in index", id)
 	}
@@ -143,25 +128,3 @@ func (c *Connector) lookup(id string) (store.StorageConnector, error) {
 	return nil, fmt.Errorf("multi: backend %q for chunk %s not found", name, id)
 }
 
-func (c *Connector) loadIndex() error {
-	data, err := os.ReadFile(c.dbPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return json.Unmarshal(data, &c.index)
-}
-
-func (c *Connector) saveIndex() error {
-	c.mu.RLock()
-	data, err := json.Marshal(c.index)
-	c.mu.RUnlock()
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(c.dbPath, data, 0600)
-}

@@ -158,9 +158,7 @@ func TestIndexPersistsAndLoads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mc2.mu.RLock()
-	name, ok := mc2.index["c1"]
-	mc2.mu.RUnlock()
+	name, ok := mc2.index.Get("c1")
 	if !ok || name != "b" {
 		t.Fatalf("index not loaded: ok=%v name=%q", ok, name)
 	}
