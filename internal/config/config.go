@@ -35,6 +35,9 @@ type BackendConfig struct {
 	ApiKey    string  `toml:"api_key"`  // W&B API key
 	Entity    string  `toml:"entity"`   // W&B entity (username or team)
 	Project   string  `toml:"project"`  // W&B project name
+	Token     string  `toml:"token"`    // GitHub PAT
+	Owner     string  `toml:"owner"`    // GitHub repo owner
+	Repo      string  `toml:"repo"`     // GitHub repo name
 	RateLimit   float64 `toml:"rate_limit"`   // requests/sec, 0 = no limit
 	MaxCapacity int64   `toml:"max_capacity"` // bytes, 0 = unlimited
 	Priority    int     `toml:"priority"`     // lower = preferred for writes
