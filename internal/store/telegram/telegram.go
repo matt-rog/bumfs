@@ -3,27 +3,31 @@ package telegram
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
-	"os"
-	"sync"
+	"path/filepath"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 
+	"github.com/matt-rog/bumfs/internal/config"
 	"github.com/matt-rog/bumfs/internal/store"
 )
+
+func init() {
+	store.Register("telegram", func(cfg config.BackendConfig, dataDir string) (store.StorageConnector, error) {
+		dbPath := filepath.Join(dataDir, "telegram_index.json")
+		return New(cfg.BotToken, cfg.ChatID, dbPath)
+	})
+}
 
 // Backend stores chunks as Telegram documents in a chat.
 type Backend struct {
 	bot    *bot.Bot
 	chatID int64
-	mu     sync.RWMutex
-	index  map[string]string // chunkID → telegram file_id
-	dbPath string            // path to persist the index
+	index  *store.Index[string]
 }
 
 var _ store.StorageConnector = (*Backend)(nil)
@@ -47,18 +51,16 @@ func newWithOpts(botToken string, chatID int64, dbPath string, opts ...bot.Optio
 		return nil, fmt.Errorf("telegram backend: create bot: %w", err)
 	}
 
-	backend := &Backend{
-		bot:    b,
-		chatID: chatID,
-		index:  make(map[string]string),
-		dbPath: dbPath,
-	}
-
-	if err := backend.loadIndex(); err != nil {
+	idx, err := store.NewIndex[string](dbPath)
+	if err != nil {
 		return nil, fmt.Errorf("telegram backend: load index: %w", err)
 	}
 
-	return backend, nil
+	return &Backend{
+		bot:    b,
+		chatID: chatID,
+		index:  idx,
+	}, nil
 }
 
 func (b *Backend) Name() string { return "telegram" }
@@ -76,12 +78,9 @@ func (b *Backend) Write(ctx context.Context, id string, data []byte) error {
 	}
 
 	fileID := msg.Document.FileID
+	b.index.Set(id, fileID)
 
-	b.mu.Lock()
-	b.index[id] = fileID
-	b.mu.Unlock()
-
-	if err := b.saveIndex(); err != nil {
+	if err := b.index.Save(); err != nil {
 		return fmt.Errorf("telegram write %s: persist index: %w", id, err)
 	}
 
@@ -89,10 +88,7 @@ func (b *Backend) Write(ctx context.Context, id string, data []byte) error {
 }
 
 func (b *Backend) Read(ctx context.Context, id string) ([]byte, error) {
-	b.mu.RLock()
-	fileID, ok := b.index[id]
-	b.mu.RUnlock()
-
+	fileID, ok := b.index.Get(id)
 	if !ok {
 		return nil, fmt.Errorf("telegram read %s: chunk not found in index", id)
 	}
@@ -128,11 +124,9 @@ func (b *Backend) Read(ctx context.Context, id string) ([]byte, error) {
 }
 
 func (b *Backend) Delete(_ context.Context, id string) error {
-	b.mu.Lock()
-	delete(b.index, id)
-	b.mu.Unlock()
+	b.index.Delete(id)
 
-	if err := b.saveIndex(); err != nil {
+	if err := b.index.Save(); err != nil {
 		return fmt.Errorf("telegram delete %s: persist index: %w", id, err)
 	}
 
@@ -140,9 +134,7 @@ func (b *Backend) Delete(_ context.Context, id string) error {
 }
 
 func (b *Backend) Capacity() (total, used, free uint64) {
-	b.mu.RLock()
-	n := uint64(len(b.index))
-	b.mu.RUnlock()
+	n := uint64(b.index.Len())
 	used = n * (1 << 20) // estimate: 1MB per chunk
 	return math.MaxUint64, used, math.MaxUint64 - used
 }
@@ -155,28 +147,3 @@ func (b *Backend) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-func (b *Backend) loadIndex() error {
-	data, err := os.ReadFile(b.dbPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return json.Unmarshal(data, &b.index)
-}
-
-func (b *Backend) saveIndex() error {
-	b.mu.RLock()
-	data, err := json.Marshal(b.index)
-	b.mu.RUnlock()
-
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(b.dbPath, data, 0600)
-}
