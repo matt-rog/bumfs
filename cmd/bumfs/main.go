@@ -18,12 +18,15 @@ import (
 	"github.com/matt-rog/bumfs/internal/store"
 	"github.com/matt-rog/bumfs/internal/store/cache"
 	"github.com/matt-rog/bumfs/internal/store/caplimit"
-	"github.com/matt-rog/bumfs/internal/store/local"
 	"github.com/matt-rog/bumfs/internal/store/multi"
 	"github.com/matt-rog/bumfs/internal/store/ratelimit"
-	"github.com/matt-rog/bumfs/internal/store/telegram"
-	"github.com/matt-rog/bumfs/internal/store/wandb"
 	"github.com/winfsp/cgofuse/fuse"
+
+	// Register storage backends via init().
+	_ "github.com/matt-rog/bumfs/internal/store/github"
+	_ "github.com/matt-rog/bumfs/internal/store/local"
+	_ "github.com/matt-rog/bumfs/internal/store/telegram"
+	_ "github.com/matt-rog/bumfs/internal/store/wandb"
 )
 
 func main() {
@@ -87,21 +90,10 @@ func cmdMount() {
 	}
 
 	// Build all backends with rate limiting
+	dataDir := filepath.Dir(cfg.BumFS.MetadataDB)
 	var backends []store.StorageConnector
 	for name, backendCfg := range cfg.Backends {
-		var raw store.StorageConnector
-		switch backendCfg.Type {
-		case "local":
-			raw, err = local.New(backendCfg.Path)
-		case "telegram":
-			dbPath := filepath.Join(filepath.Dir(cfg.BumFS.MetadataDB), "telegram_index.json")
-			raw, err = telegram.New(backendCfg.BotToken, backendCfg.ChatID, dbPath)
-		case "wandb":
-			dbPath := filepath.Join(filepath.Dir(cfg.BumFS.MetadataDB), "wandb_index.json")
-			raw, err = wandb.New(backendCfg.ApiKey, backendCfg.Entity, backendCfg.Project, dbPath)
-		default:
-			log.Fatalf("bumfs: unknown backend type %q for %q", backendCfg.Type, name)
-		}
+		raw, err := store.Create(backendCfg.Type, backendCfg, dataDir)
 		if err != nil {
 			log.Fatalf("bumfs: create backend %q: %v", name, err)
 		}
